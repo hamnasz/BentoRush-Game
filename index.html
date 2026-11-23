@@ -320,19 +320,64 @@ function resize(){
 }
 
 /* =========================================================
-   Sprites (character PNGs) + generated sprites
+   Artwork (character PNGs) + generated sprites
+   Every sheet is a horizontal strip of equal cells. The cell size is measured from
+   the PNG itself once it loads (naturalWidth / cells × naturalHeight), so sheets can
+   be re-exported at any resolution. A file that fails to load falls back gracefully.
    ========================================================= */
-const SPR = {};
-for (const k of ['idle', 'walk', 'hold', 'happy']){
+function loadArt(src, cells = 1, extra = {}){
   const im = new Image();
-  im.onload = () => { im.ok = true; };
-  im.onerror = () => { im.ok = false; };
-  im.src = k + '.png';
-  SPR[k] = im;
+  const art = Object.assign({ img: im, src, cells, ok: false, cw: 0, ch: 0 }, extra);
+  im.onload = () => {
+    art.cw = im.naturalWidth / cells;
+    art.ch = im.naturalHeight;
+    art.ok = art.cw > 0 && art.ch > 0;
+  };
+  im.onerror = () => { art.ok = false; };
+  im.src = src;
+  return art;
 }
-// all four PNGs share a 264x440 frame with the feet at bottom-centre
-const PH = 158, PW = PH * 264 / 440;
-const HOLD_X = (165 - 132) / 440 * PH, HOLD_Y = (214 - 440) / 440 * PH; // where her hands are in hold.png
+const isOk = a => !!(a && a.ok);
+
+// Sakura. Each cell is a full-height frame with her feet at the bottom-centre, drawn PH tall.
+// Hand points are [x, y] as fractions of the cell height, measured from the bottom-centre of
+// the right-facing art; they are mirrored automatically when she faces left.
+const PH = 158;
+const HOLD_HAND = [(165 - 132) / 440, (214 - 440) / 440];          // her hands in hold.png
+const SAKURA = {
+  idle:  loadArt('idle.png'),
+  hold:  loadArt('hold.png', 1, { hands: [HOLD_HAND], snack: 40, lift: 0, fist: 0 }),
+  happy: loadArt('happy.png'),
+  walk1: loadArt('walk.png'),                                       // old single pose, fallback only
+  back:  loadArt('assets/sakura/back.png', 1, { hands: [[0.1357, -0.3739]], snack: 30, lift: .22, fist: .03 }),
+  walkRight: loadArt('assets/sakura/walk_right.png', 4, {
+    hands: [[0.198, -0.4314], [0.1556, -0.3706], [0.1895, -0.4328], [0.1867, -0.4017]],   // the forward hand, per frame
+    snack: 34, lift: .24, fist: .032,
+  }),
+  // Optional sheets: not supplied yet. Drop a 4-cell PNG with this name into assets/sakura/
+  // and it is used automatically. Adjust `hands` once the art exists (defaults to the hold pose).
+  carryWalkRight: loadArt('assets/sakura/carry_walk_right.png', 4, { hands: null, snack: 38, lift: 0, fist: 0 }),
+  walkUp:   loadArt('assets/sakura/walk_up.png', 4,   { hands: null, snack: 30, lift: .22, fist: 0 }),
+  walkDown: loadArt('assets/sakura/walk_down.png', 4, { hands: null, snack: 38, lift: 0, fist: 0 }),
+};
+const WALK_FRAMES = 4;
+const STEP = 26;           // logical px Sakura travels per walk frame (≈ half a stride in the art)
+
+// Illustrated guests: 4 cells in mood order wait / worried / happy / sad.
+// `<id>.png` is the full figure, `<id>_hands.png` holds only the fists so they can rest on
+// top of the tabletop while the lower torso stays hidden behind it. `wrist` = wrist line as a
+// fraction of the cell height (the figure is centred horizontally in every cell).
+const GUESTS = [
+  { id: 'boy',     wrist: 0.8939 },
+  { id: 'courier', wrist: 0.8799 },
+  { id: 'grandma', wrist: 0.8785 },
+].map(g => Object.assign(g, {
+  body:  loadArt(`assets/customers/${g.id}.png`, 4),
+  hands: loadArt(`assets/customers/${g.id}_hands.png`, 4),
+}));
+const MOOD_CELL = { wait: 0, worried: 1, happy: 2, sad: 3 };
+const GUEST_H = 136;       // drawn height of one guest cell
+const TABLE_BACK = -33;    // back edge of the tabletop (relative to table centre) — wrists sit here
 
 function makeCanvas(w, h){ const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
 function makeGlow(r, g, b){
@@ -540,9 +585,9 @@ const STATIONS = SNACK_KEYS.map((type, i) => {
 });
 const TABLES = [
   { x: 990,  y: 305, chair: '#bfe8d6' },
-  { x: 1155, y: 470, chair: '#ffd0dc' },
+  { x: 1162, y: 470, chair: '#ffd0dc' },
   { x: 990,  y: 635, chair: '#dccffb' },
-].map(o => Object.assign(o, { state: 'empty', cool: 0, cu: null, order: null, lastOrder: null, patience: 1, maxPat: 1, anim: 0, wrong: 0, blink: 0, nextBlink: 2 }));
+].map(o => Object.assign(o, { state: 'empty', cool: 0, cu: null, order: null, lastOrder: null, lastGuest: null, patience: 1, maxPat: 1, anim: 0, wrong: 0, blink: 0, nextBlink: 2 }));
 
 const LIGHT_HOOKS = [236, 585, 930, 1278];
 const LIGHT_Y = 3, LIGHT_SAG = 22;
@@ -957,7 +1002,14 @@ let best = loadBest();
 let target = null;
 const keys = new Set();
 
-const player = { x: 585, y: 470, vx: 0, vy: 0, facing: 1, phase: 0, holding: null, happy: 0, squish: 0, pop: 0, sprite: 'idle' };
+const player = {
+  x: 585, y: 470, vx: 0, vy: 0, facing: 1, holding: null, happy: 0, squish: 0, pop: 0,
+  dir: 'side',          // side | up | down — dominant axis of the last movement input
+  input: false,         // a movement key is held
+  speed: 0,             // actual speed after collisions (px/s)
+  walkDist: 0,          // distance actually travelled; drives the walk frames
+  lastFrame: -1, lastArt: null,
+};
 const MAXS = 340;
 
 const particles = [];
@@ -1109,13 +1161,25 @@ const SHIRT = ['#ffd27f', '#a8e0c8', '#c8b8ff', '#ffb4c6', '#9fd0f5', '#ffc59e']
 const RIBBON = ['#ff7fa6', '#ff6b7f', '#a98bff', '#5fbfa0'];
 const ACC = ['cat', 'bunny', 'bear', 'bow', 'sprout', 'none', 'cat', 'bow', 'bunny'];
 
-function makeCustomer(){
-  return { hair: pick(HAIR), skin: pick(SKIN), shirt: pick(SHIRT), ribbon: pick(RIBBON), ribbon2: pick(RIBBON), acc: pick(ACC), long: Math.random() < .4 };
+// The guest's identity is chosen once here and kept for the whole visit.
+function makeCustomer(tb){
+  const cu = { hair: pick(HAIR), skin: pick(SKIN), shirt: pick(SHIRT), ribbon: pick(RIBBON), ribbon2: pick(RIBBON), acc: pick(ACC), long: Math.random() < .4, guest: null };
+  const ready = GUESTS.filter(g => g.body.ok && g.hands.ok);
+  if (ready.length){
+    // prefer someone who isn't already sitting at another table, then someone new for this table
+    const seated = new Set(TABLES.filter(t => t !== tb && t.cu && t.cu.guest).map(t => t.cu.guest.id));
+    let pool = ready.filter(g => !seated.has(g.id));
+    if (!pool.length) pool = ready;
+    if (pool.length > 1 && tb && tb.lastGuest){ const fresh = pool.filter(g => g.id !== tb.lastGuest); if (fresh.length) pool = fresh; }
+    cu.guest = pick(pool);
+    if (tb) tb.lastGuest = cu.guest.id;
+  }
+  return cu;       // no illustrated guest available → the drawn chibi below is used
 }
 const CO = 'rgba(107,65,80,.78)';
 function strokeFill(c, fill){ c.fillStyle = fill; c.fill(); c.stroke(); }
 
-function drawCustomer(c, cu, mood, blink){
+function drawChibiGuest(c, cu, mood, blink){
   c.lineWidth = 2.2; c.strokeStyle = CO; c.lineJoin = 'round'; c.lineCap = 'round';
   // ears behind the hair
   if (cu.acc === 'bunny'){
@@ -1231,7 +1295,46 @@ function customerXform(tb){
   }
   else if (tb.state === 'sad'){ const q = clamp(tb.anim / 1.3, 0, 1); a = q < .4 ? 1 : 1 - (q - .4) / .6; dy += q * 10; s = 1 - q * .08; }
   else if (tb.state === 'bye'){ const q = clamp(tb.anim / 1.1, 0, 1); a = 1 - q; dy -= q * 16; }
-  return { a: clamp(a, 0, 1), s, dy };
+  return { a: clamp(a, 0, 1), s, sy: 1, dy };
+}
+// Illustrated guests are anchored at their wrists on the table's back edge, so every effect
+// scales around that point instead of moving them (their hands never leave the table).
+function guestXform(tb){
+  let a = 1, s = 1, sy = 1 + Math.sin(T * 2.2 + tb.x * .01) * .006, dy = 0;   // gentle breathing
+  if (tb.state === 'arrive'){ const q = clamp(tb.anim / .45, 0, 1); a = clamp(q * 2.2, 0, 1); s = .72 + .28 * easeOutBack(q); }
+  else if (tb.state === 'happy'){
+    const q = clamp(tb.anim / 1.3, 0, 1);
+    sy += Math.abs(Math.sin(q * Math.PI * 3)) * .035 * (1 - q);
+    if (q > .62) a = 1 - (q - .62) / .38;
+  }
+  else if (tb.state === 'sad'){ const q = clamp(tb.anim / 1.3, 0, 1); a = q < .4 ? 1 : 1 - (q - .4) / .6; dy = q * 3; sy -= q * .03; }
+  else if (tb.state === 'bye'){ const q = clamp(tb.anim / 1.1, 0, 1); a = 1 - q; }
+  return { a: clamp(a, 0, 1), s, sy, dy };
+}
+
+// layer 'body' is drawn before the tabletop, layer 'hands' after it.
+function drawCustomer(c, tb, xf, layer){
+  const cu = tb.cu;
+  const g = cu.guest;
+  if (g){
+    const art = layer === 'body' ? g.body : g.hands;
+    if (!isOk(art)) return;
+    const cell = MOOD_CELL[customerMood(tb)];          // one expression per event, held until the next
+    const dh = GUEST_H, dw = dh * art.cw / art.ch;
+    c.save();
+    c.globalAlpha = xf.a;
+    c.translate(tb.x, tb.y + TABLE_BACK + xf.dy);
+    c.scale(xf.s, xf.s * xf.sy);
+    c.drawImage(art.img, cell * art.cw, 0, art.cw, art.ch, -dw / 2, -g.wrist * dh, dw, dh);
+    c.restore();
+    return;
+  }
+  // fallback: the original drawn chibi with round hands
+  c.save(); c.globalAlpha = xf.a;
+  c.translate(tb.x, tb.y - 24 + xf.dy); c.scale(xf.s, xf.s);
+  if (layer === 'body') drawChibiGuest(c, cu, customerMood(tb), tb.blink > 0);
+  else { c.lineWidth = 2; c.strokeStyle = CO; for (const s of [-1, 1]){ circ(c, s * 21, -6, 6.5); strokeFill(c, cu.skin); } }
+  c.restore();
 }
 
 /* =========================================================
@@ -1248,12 +1351,10 @@ function drawTable(c, tb){
   ell(c, x, y + 40, 76, 16, 'rgba(120,60,70,.16)');
   drawChair(c, x, y - 38, tb.chair);
   let xf = null;
+  const illustrated = !!(tb.cu && tb.cu.guest);
   if (tb.cu){
-    xf = customerXform(tb);
-    c.save(); c.globalAlpha = xf.a;
-    c.translate(x, y - 24 + xf.dy); c.scale(xf.s, xf.s);
-    drawCustomer(c, tb.cu, customerMood(tb), tb.blink > 0);
-    c.restore();
+    xf = illustrated ? guestXform(tb) : customerXform(tb);
+    drawCustomer(c, tb, xf, 'body');            // the tabletop below covers the lower torso
   }
   // pedestal
   c.fillStyle = '#d49b76'; rr(c, x - 7, y + 4, 14, 34, 5); c.fill();
@@ -1277,20 +1378,17 @@ function drawTable(c, tb){
     c.fillStyle = '#ffb3cb'; for (let i = 0; i < 5; i++){ const a = i / 5 * TAU; circ(c, fx + Math.cos(a) * 3, fy + Math.sin(a) * 3, 2.3); c.fill(); }
     circ(c, fx, fy, 1.5); c.fillStyle = '#ffd77e'; c.fill();
   }
+  // illustrated guests: their own fists rest on the tabletop, wrists on the back edge
+  if (illustrated) drawCustomer(c, tb, xf, 'hands');
   // the treat they just received
   if (tb.state === 'happy'){
     c.save(); c.globalAlpha = xf ? xf.a : 1;
-    drawSnack(c, tb.order, x - 6, y - 4, 32);
+    if (illustrated) drawSnack(c, tb.order, x - 4, y + 3, 32);
+    else drawSnack(c, tb.order, x - 6, y - 4, 32);
     c.restore();
   }
-  // hands resting on the table
-  if (tb.cu && xf){
-    c.save(); c.globalAlpha = xf.a;
-    c.translate(x, y - 24 + xf.dy); c.scale(xf.s, xf.s);
-    c.lineWidth = 2; c.strokeStyle = CO;
-    for (const s of [-1, 1]){ circ(c, s * 21, -6, 6.5); strokeFill(c, tb.cu.skin); }
-    c.restore();
-  }
+  // drawn fallback guests keep the round hands
+  if (tb.cu && xf && !illustrated) drawCustomer(c, tb, xf, 'hands');
   // highlight ring
   if (target && target.table === tb){
     const pulse = .5 + .5 * Math.sin(T * 7);
@@ -1310,7 +1408,8 @@ function drawBubble(c, tb){
   else { sc = 1 - clamp(tb.anim / .18, 0, 1); }
   if (sc <= .01) return;
   const ratio = clamp(tb.patience / tb.maxPat, 0, 1);
-  let bx = tb.x + 40, by = tb.y - 170;
+  // up and to the right of the head, so the guest's face stays visible
+  let bx = tb.x + 58, by = tb.y - 180;
   if (tb.state === 'wait' && ratio < .25) bx += Math.sin(T * 38) * 1.7;
   if (tb.wrong > 0) bx += Math.sin(T * 55) * 5 * (tb.wrong / .5);
   const match = state === 'playing' && tb.state === 'wait' && player.holding === tb.order;
@@ -1326,10 +1425,10 @@ function drawBubble(c, tb){
   // outline pass then fill pass => cloud with a single outer outline
   c.lineWidth = 5; c.strokeStyle = match ? '#ff86ab' : '#ffc6d6';
   for (const [x, y, r] of BUBBLE_BLOBS){ circ(c, x, y, r); c.stroke(); }
-  circ(c, -24, 50, 7); c.stroke(); circ(c, -34, 63, 4.5); c.stroke();
+  circ(c, -18, 52, 6.5); c.stroke(); circ(c, -27, 64, 4.3); c.stroke();
   c.fillStyle = '#fffdfb';
   for (const [x, y, r] of BUBBLE_BLOBS){ circ(c, x, y, r); c.fill(); }
-  circ(c, -24, 50, 7); c.fill(); circ(c, -34, 63, 4.5); c.fill();
+  circ(c, -18, 52, 6.5); c.fill(); circ(c, -27, 64, 4.3); c.fill();
   // order
   drawSnack(c, tb.order, 0, -9, 42);
   // patience bar
@@ -1345,12 +1444,38 @@ function drawBubble(c, tb){
 /* =========================================================
    Player
    ========================================================= */
+// Chooses Sakura's artwork for this moment: which sheet, which cell, and where the snack goes.
 function spriteKey(){
-  if (player.happy > 0) return 'happy';
-  if (player.holding) return 'hold';
-  if (Math.hypot(player.vx, player.vy) > 30) return 'walk';
-  return 'idle';
+  const p = player;
+  const S = SAKURA;
+  const moving = p.speed > 20;
+  const pushing = !moving && p.input && state === 'playing';      // walking into the counter or a table
+  const carrying = !!p.holding;
+  let frame = Math.floor(p.walkDist / STEP) % WALK_FRAMES;
+  if (pushing) frame -= frame % 2;                                // legs stop on a both-feet-down frame
+  const firstOk = (...arts) => arts.find(isOk) || arts[arts.length - 1];
+  const handOf = (art, f) => (art.hands ? art.hands[Math.min(f, art.hands.length - 1)] : HOLD_HAND);
+  const pose = (art, o = {}) => Object.assign({ art, key: art.src, frame: 0, anim: false, bounce: false, hand: null }, o);
+
+  if (p.happy > 0 && !moving) return pose(firstOk(S.happy, S.idle));
+  if (moving || pushing){
+    let sheet, still;
+    if (p.dir === 'side'){
+      sheet = carrying && isOk(S.carryWalkRight) ? S.carryWalkRight : S.walkRight;
+      still = carrying ? firstOk(S.hold, S.idle) : firstOk(S.walk1, S.idle);
+    } else if (p.dir === 'up'){
+      sheet = S.walkUp;                                            // not supplied yet → back view
+      still = firstOk(S.back, carrying ? S.hold : S.idle, S.idle);
+    } else {
+      sheet = S.walkDown;                                          // not supplied yet → front view
+      still = carrying ? firstOk(S.hold, S.idle) : S.idle;
+    }
+    if (isOk(sheet)) return pose(sheet, { frame, anim: true, hand: carrying ? handOf(sheet, frame) : null });
+    return pose(still, { bounce: moving, hand: carrying ? handOf(still, 0) : null });
+  }
+  return carrying ? pose(firstOk(S.hold, S.idle), { hand: HOLD_HAND }) : pose(S.idle);
 }
+
 function updatePlayer(dt, allowInput){
   const p = player;
   let ix = 0, iy = 0;
@@ -1360,12 +1485,15 @@ function updatePlayer(dt, allowInput){
     if (keys.has('KeyW') || keys.has('ArrowUp')) iy -= 1;
     if (keys.has('KeyS') || keys.has('ArrowDown')) iy += 1;
   }
+  p.input = ix !== 0 || iy !== 0;
+  if (p.input) p.dir = Math.abs(ix) >= Math.abs(iy) ? 'side' : (iy < 0 ? 'up' : 'down');
   const len = Math.hypot(ix, iy) || 1;
   ix /= len; iy /= len;
   const k = 1 - Math.exp(-dt * 12);
   p.vx += (ix * MAXS - p.vx) * k;
   p.vy += (iy * MAXS - p.vy) * k;
   if (ix !== 0) p.facing = ix > 0 ? 1 : -1;
+  const ox = p.x, oy = p.y;
   p.x += p.vx * dt; p.y += p.vy * dt;
   for (let i = 0; i < 2; i++){
     p.x = clamp(p.x, 250, 1248); p.y = clamp(p.y, 236, 706);
@@ -1374,12 +1502,18 @@ function updatePlayer(dt, allowInput){
       pushOut(p, tb.x, tb.y - 36, 58, 40);
     }
   }
-  const spd = Math.hypot(p.vx, p.vy);
-  if (spd > 25){
-    const before = Math.sin(p.phase);
-    p.phase += dt * (8 + spd / 45);
-    if (Math.sign(Math.sin(p.phase)) !== Math.sign(before)) puffs(p.x - p.facing * 8, p.y, 3, '246,226,212', true, 6, .7);
-  }
+  // Animate from what actually happened after collisions, not from what was attempted:
+  // pressed against the counter she doesn't move, so her legs don't either.
+  const mx = p.x - ox, my = p.y - oy, moved = Math.hypot(mx, my);
+  if (dt > 0){ p.vx = mx / dt; p.vy = my / dt; p.speed = moved / dt; }
+  if (p.speed > 20){
+    if (!p.wasMoving) p.walkDist = STEP + .01;                     // first drawn step lifts a foot
+    p.walkDist += moved;
+    p.wasMoving = true;
+    const f = Math.floor(p.walkDist / STEP) % WALK_FRAMES;
+    if (f !== p.lastFrame && f % 2 === 0) puffs(p.x + p.facing * 10, p.y, 3, '246,226,212', true, 6, .7);   // a foot lands
+    p.lastFrame = f;
+  } else p.wasMoving = false;
   p.happy = Math.max(0, p.happy - dt);
   p.squish = Math.max(0, p.squish - dt);
   p.pop = Math.max(0, p.pop - dt * 7);
@@ -1393,38 +1527,59 @@ function pushOut(p, cx, cy, rx, ry){
   p.y = cy + dy / d * ry;
 }
 
+// Draws one cell of a sheet, PH tall, feet on the origin.
+function drawSakuraArt(c, art, frame){
+  if (!isOk(art)) return false;
+  const dw = PH * art.cw / art.ch;
+  c.drawImage(art.img, frame * art.cw, 0, art.cw, art.ch, -dw / 2, -PH, dw, PH);
+  return true;
+}
+
 function drawPlayer(c){
   const p = player;
-  const key = spriteKey();
-  if (key !== p.sprite){ p.sprite = key; p.pop = 1; }
-  const spd = Math.hypot(p.vx, p.vy), mk = Math.min(1, spd / MAXS);
-  const s = Math.abs(Math.sin(p.phase));
-  let bob = -s * 10 * mk;
-  let sx = 1 - (s - .5) * .09 * mk;
-  let sy = 1 + (s - .5) * .11 * mk;
-  const rot = Math.sin(p.phase) * .035 * mk;
-  const br = Math.sin(T * 2.4) * (1 - mk);
+  const pose = spriteKey();
+  if (pose.key !== p.lastArt){ p.lastArt = pose.key; p.pop = 1; }   // not on walk-frame changes
+  const mk = Math.min(1, p.speed / MAXS);
+  const ph = p.walkDist / STEP * Math.PI / 2;
+  let bob = 0, sx = 1, sy = 1, rot = 0;
+  if (pose.anim){
+    bob = pose.frame % 2 ? -1.5 * mk : 0;            // the drawn legs carry the motion
+  } else if (pose.bounce){
+    const s = Math.abs(Math.sin(ph));                // no step frames for this direction yet: soft hop per step
+    bob = -s * 5 * mk; sx = 1 - (s - .5) * .03 * mk; sy = 1 + (s - .5) * .04 * mk; rot = Math.sin(ph) * .015 * mk;
+  }
+  const br = Math.sin(T * 2.4) * (1 - Math.min(1, p.speed / 60));   // breathing while standing
   sy += br * .014; sx -= br * .008;
-  if (p.happy > 0){
+  if (pose.art === SAKURA.happy && p.happy > 0){
     const q = 1 - p.happy / .9;
     const hop = Math.sin(Math.min(1, q * 1.7) * Math.PI);
     bob -= hop * 16; sy += hop * .06; sx -= hop * .04;
   }
   if (p.squish > 0){
     const q = Math.sin(p.squish / .28 * Math.PI);
-    sy -= q * .12; sx += q * .1;
+    sy -= q * .1; sx += q * .08;
   }
-  sy -= p.pop * .05; sx += p.pop * .05;
+  sy -= p.pop * .035; sx += p.pop * .035;
 
   ell(c, p.x, p.y + 1, 34 * (1 + bob / 70), 9 * (1 + bob / 70), 'rgba(110,55,70,.2)');
   c.save();
   c.translate(p.x, p.y + bob);
   c.rotate(rot);
-  c.scale(sx * p.facing, sy);
-  const img = SPR[key];
-  if (img && img.ok) c.drawImage(img, -PW / 2, -PH, PW, PH);
-  else drawFallbackChibi(c, key);
-  if (p.holding) drawSnack(c, p.holding, HOLD_X, HOLD_Y + Math.sin(T * 5) * .8, 40);
+  c.scale(sx * p.facing, sy);                         // facing -1 mirrors the art and the snack offset
+  if (!drawSakuraArt(c, pose.art, pose.frame)) drawFallbackChibi(c, pose.art === SAKURA.happy ? 'happy' : 'idle');
+  if (p.holding && pose.hand){
+    // the snack sits just above her fist (lift = share of the snack's size) …
+    const a = pose.art, size = a.snack || 38;
+    const hx = pose.hand[0] * PH, hy = pose.hand[1] * PH;
+    const wobble = pose.anim ? 0 : Math.sin(T * 5) * .8;
+    drawSnack(c, p.holding, hx, hy - size * (a.lift || 0) + wobble, size);
+    // … and her fist is drawn again on top, so she visibly grips it
+    if (a.fist && isOk(a)){
+      c.save(); c.beginPath(); c.arc(hx, hy, a.fist * PH, 0, TAU); c.clip();
+      drawSakuraArt(c, a, pose.frame);
+      c.restore();
+    }
+  }
   c.restore();
 }
 
@@ -1462,7 +1617,7 @@ function drawFallbackChibi(c, key){
 function progress(){ return clamp(playTime / SHIFT, 0, 1); }
 
 function spawnCustomer(tb){
-  tb.cu = makeCustomer();
+  tb.cu = makeCustomer(tb);
   let o;
   do { o = pick(SNACK_KEYS); } while (o === tb.lastOrder && Math.random() < .65);
   tb.order = o; tb.lastOrder = o;
@@ -1585,7 +1740,7 @@ let hintTimer = 0;
 function resetGame(){
   score = 0; combo = 0; bestCombo = 0; served = 0; missed = 0;
   timeLeft = SHIFT; playTime = 0; lastSec = SHIFT;
-  Object.assign(player, { x: 585, y: 470, vx: 0, vy: 0, facing: 1, holding: null, happy: 0, squish: 0, pop: 0 });
+  Object.assign(player, { x: 585, y: 470, vx: 0, vy: 0, facing: 1, holding: null, happy: 0, squish: 0, pop: 0, dir: 'side', input: false, speed: 0, walkDist: 0, wasMoving: false, lastFrame: -1 });
   TABLES.forEach((tb, i) => { tb.state = 'empty'; tb.cu = null; tb.order = null; tb.cool = [.6, 2.4, 4.3][i]; tb.wrong = 0; tb.anim = 0; });
   particles.length = 0; texts.length = 0;
   shown.score = shown.combo = shown.sec = -1;
